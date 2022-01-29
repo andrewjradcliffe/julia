@@ -89,6 +89,7 @@ mutable struct InferenceState
     sptypes::Vector{Any}    # types of static parameter
     slottypes::Vector{Any}
     mod::Module
+    curbb::Int
     currpc::LineNum
     pclimitations::IdSet{InferenceState} # causes of precision restrictions (LimitedAccuracy) on currpc ssavalue
     limitations::IdSet{InferenceState} # causes of precision restrictions (LimitedAccuracy) on return
@@ -98,13 +99,13 @@ mutable struct InferenceState
     world::UInt
     valid_worlds::WorldRange
     nargs::Int
-    stmt_types::Vector{Union{Nothing, VarTable}}
     stmt_edges::Vector{Union{Nothing, Vector{Any}}}
     stmt_info::Vector{Any}
     # return type
     bestguess #::Type
     # current active instruction pointers
-    ip::BitSetBoundedMinPrioritySet
+    was_reached::BitSet
+    ip::BitSet#=TODO BoundedMinPrioritySet=#
     # current exception handler info
     handler_at::Vector{LineNum}
     # ssavalue sparsity and restart info
@@ -126,6 +127,14 @@ mutable struct InferenceState
     # Inferred purity flags
     ipo_effects::Effects
 
+    cfg::CFG
+
+    # TODO: Could keep this sparsely by doing liveness structural liveness
+    # analysis ahead of time.
+    bb_vars::Vector{VarTable}
+
+    pc_vars::VarTable
+
     # The interpreter that created this inference state. Not looked at by
     # NativeInterpreter. But other interpreters may use this to detect cycles
     interp::AbstractInterpreter
@@ -142,36 +151,36 @@ mutable struct InferenceState
 
         nssavalues = src.ssavaluetypes::Int
         src.ssavaluetypes = Any[ NOT_FOUND for i = 1:nssavalues ]
-        stmt_info = Any[ nothing for i = 1:length(code) ]
-
         nstmts = length(code)
-        s_types = Union{Nothing, VarTable}[ nothing for i = 1:nstmts ]
-        s_edges = Union{Nothing, Vector{Any}}[ nothing for i = 1:nstmts ]
+        stmt_edges = Union{Nothing, Vector{Any}}[ nothing for i = 1:nstmts ]
+        stmt_info = Any[ nothing for i = 1:nstmts ]
 
         # initial types
         nslots = length(src.slotflags)
         argtypes = result.argtypes
         nargs = length(argtypes)
-        s_argtypes = VarTable(undef, nslots)
         slottypes = Vector{Any}(undef, nslots)
+        pc_vars = VarTable(undef, nslots)
+        bb_entry_proto = VarTable(undef, nslots)
         for i in 1:nslots
             at = (i > nargs) ? Bottom : argtypes[i]
-            s_argtypes[i] = VarState(at, i > nargs)
+            pc_vars[i] = VarState(at, i > nargs)
+            bb_entry_proto[i] = VarState(Bottom, i > nargs)
             slottypes[i] = at
         end
-        s_types[1] = s_argtypes
 
         ssavalue_uses = find_ssavalue_uses(code, nssavalues)
 
         # exception handlers
-        ip = BitSetBoundedMinPrioritySet(nstmts)
-        handler_at = compute_trycatch(src.code, ip.elems)
-        push!(ip, 1)
+        handler_at = compute_trycatch(src.code, BitSet())
+        # TODO ip = BitSetBoundedMinPrioritySet()
+        ip = BitSet(1)
 
         # `throw` block deoptimization
         params.unoptimize_throw_blocks && mark_throw_blocks!(src, handler_at)
 
         mod = isa(def, Method) ? def.module : def
+        world = get_world_counter(interp)
         valid_worlds = WorldRange(src.min_world,
             src.max_world == typemax(UInt) ? get_world_counter() : src.max_world)
 
@@ -185,21 +194,24 @@ mutable struct InferenceState
         inbounds_taints_consistency = !(inbounds === :on || (inbounds === :default && !any_inbounds(code)))
         consistent = inbounds_taints_consistency ? TRISTATE_UNKNOWN : ALWAYS_TRUE
 
+        cfg = compute_basic_blocks(code)
+        bb_vars = VarTable[i == 1 ? copy(pc_vars) : copy(bb_entry_proto)
+            for i = 1:length(cfg.blocks)]
+
         @assert cache === :no || cache === :local || cache === :global
         frame = new(
             params, result, linfo,
-            sp, slottypes, mod, #=currpc=#0,
+            sp, slottypes, mod, #=curbb=#1, #=currpc=#1,
             #=pclimitations=#IdSet{InferenceState}(), #=limitations=#IdSet{InferenceState}(),
-            src, get_world_counter(interp), valid_worlds,
-            nargs, s_types, s_edges, stmt_info,
-            #=bestguess=#Union{}, ip, handler_at, ssavalue_uses,
+            src, world, valid_worlds, nargs, stmt_edges, stmt_info,
+            #=bestguess=#Union{}, #=was_reached=#BitSet(), ip, handler_at, ssavalue_uses,
             #=cycle_backedges=#Vector{Tuple{InferenceState,LineNum}}(),
             #=callers_in_cycle=#Vector{InferenceState}(),
             #=parent=#nothing,
             #=cached=#cache === :global,
             #=inferred=#false, #=dont_work_on_me=#false, #=restrict_abstract_call_sites=# isa(linfo.def, Module),
             #=ipo_effects=#Effects(EFFECTS_TOTAL; consistent, inbounds_taints_consistency),
-            interp)
+            cfg, bb_vars, pc_vars, interp)
         result.result = frame
         cache !== :no && push!(get_inference_cache(interp), result)
         return frame
@@ -231,6 +243,8 @@ function any_inbounds(code::Vector{Any})
     end
     return false
 end
+
+was_reached((; was_reached)::InferenceState, pc::Int) = pc in was_reached
 
 function compute_trycatch(code::Vector{Any}, ip::BitSet)
     # The goal initially is to record the frame like this for the state at exit:
@@ -437,10 +451,15 @@ function record_ssa_assign(ssa_id::Int, @nospecialize(new), frame::InferenceStat
         # guarantee convergence we need to use tmerge here to ensure that is true
         ssavaluetypes[ssa_id] = old === NOT_FOUND ? new : tmerge(old, new)
         W = frame.ip
-        s = frame.stmt_types
         for r in frame.ssavalue_uses[ssa_id]
-            if s[r] !== nothing # s[r] === nothing => unreached statement
-                push!(W, r)
+            if was_reached(frame, r)
+                usebb = block_for_inst(frame.cfg, r)
+                # We're guaranteed to visit the statement if it's in the current
+                # basic block, since SSA values can only ever appear after their
+                # def.
+                if usebb != frame.curbb
+                    push!(W, usebb)
+                end
             end
         end
     end
