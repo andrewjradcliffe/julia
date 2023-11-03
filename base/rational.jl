@@ -42,16 +42,40 @@ function divgcd(x::Integer,y::Integer)
     g = gcd(x,y)
     div(x,g), div(y,g)
 end
-function divgcd(x::T, y::T) where {T<:Signed}
+
+function divgcd(x::T, y::T) where {T<:BitSigned}
     a = x == typemin(T)
     b = y == typemin(T)
-    if a & b
-        one(T), one(T)
+    c = iszero(x)
+    d = iszero(y)
+    if (a & (b | d)) | (c & b) # same as (a & b) | (a & d) | (c & b)
+        # `pow` should evaluate to a constant.
+        # Why unsigned? because we want to dispatch directly to `ashr_int` and
+        # avoid the `ifelse` which would occur if we used `Int`.
+        # This is safe as Julia does not have zero-sized types, or,
+        # moroever, any type which is a fixed-size integer cannot have
+        # a size of zero.
+        pow = unsigned(8 * sizeof(T) - 1)
+        x >> pow, y >> pow
     else
         g = gcd(x,y)
         div(x,g), div(y,g)
     end
 end
+function divgcd_branchless(x::T, y::T) where {T<:BitSigned}
+    a = x == typemin(T)
+    b = y == typemin(T)
+    c = iszero(x)
+    d = iszero(y)
+    s = (a & (b | d)) | (c & b)
+    pow = unsigned(8 * sizeof(T) - 1)
+    x = (!s * x) + (s * x >> pow)
+    y = (!s * y) + (s * y >> pow)
+    g = gcd(x,y)
+    div(x,g), div(y,g)
+end
+
+
 
 """
     //(num, den)
