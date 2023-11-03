@@ -42,6 +42,16 @@ function divgcd(x::Integer,y::Integer)
     g = gcd(x,y)
     div(x,g), div(y,g)
 end
+function divgcd(x::T, y::T) where {T<:Signed}
+    a = x == typemin(T)
+    b = y == typemin(T)
+    if a & b
+        one(T), one(T)
+    else
+        g = gcd(x,y)
+        div(x,g), div(y,g)
+    end
+end
 
 """
     //(num, den)
